@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,6 +156,37 @@ var catalogCmdDef = &cli.Command{
 				util.CmdMiddlewareTracingConfig,
 				util.CmdMiddlewareTracingSpan,
 			),
+		},
+		{
+			Name:  "serve",
+			Usage: "Generates html and serves",
+			Action: util.ChainCmdMiddleware(cmdServe,
+				util.CmdMiddlewareLogging,
+				util.CmdMiddlewareTracingConfig,
+				util.CmdMiddlewareTracingSpan,
+			),
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    "output",
+					Aliases: []string{"o"},
+					Usage:   "Output path for HTML generation",
+				},
+				&cli.StringFlag{
+					Name:  "url-prefix",
+					Usage: "URL prefix for links within generated HTML",
+					Value: "/",
+				},
+				&cli.StringFlag{
+					Name:  "download-url",
+					Usage: "URL for warehouse to use for download links",
+				},
+				&cli.UintFlag{
+					Name:    "port",
+					Aliases: []string{"p"},
+					Usage:   "Port number for the server address",
+					Value:   8080,
+				},
+			},
 		},
 	},
 }
@@ -779,38 +811,42 @@ func cmdCatalogShow(c *cli.Context) error {
 	return nil
 }
 
-func cmdGenerateHtml(c *cli.Context) error {
-	catalogName := c.String("name")
+type protoSiteConfig struct {
+	catalogName        string
+	outputPathOverride string
+	urlPrefix          string
+	downloadUrl        string
+}
 
+func (cfg protoSiteConfig) SiteConfig(ctx context.Context) (cataloghtml.SiteConfig, error) {
 	// open the workspace set
 	wsSet, err := util.OpenWorkspaceSet()
 	if err != nil {
-		return err
+		return cataloghtml.SiteConfig{}, err
 	}
 
-	// create the catalog if it does not exist
-	exists, err := wsSet.Root().HasCatalog(catalogName)
+	exists, err := wsSet.Root().HasCatalog(cfg.catalogName)
 	if err != nil {
-		return err
+		return cataloghtml.SiteConfig{}, err
 	}
 	if !exists {
-		return fmt.Errorf("catalog %q not found", catalogName)
+		return cataloghtml.SiteConfig{}, fmt.Errorf("catalog %q not found", cfg.catalogName)
 	}
 
-	cat, err := wsSet.Root().OpenCatalog(catalogName)
+	cat, err := wsSet.Root().OpenCatalog(cfg.catalogName)
 	if err != nil {
-		return fmt.Errorf("failed to open catalog %q: %s", catalogName, err)
+		return cataloghtml.SiteConfig{}, fmt.Errorf("failed to open catalog %q: %s", cfg.catalogName, err)
 	}
 
 	// by default, output to a subdir of the catalog named `_html`
 	// this can be overriden by a cli flag that provides a path
-	outputPath, err := wsSet.Root().CatalogPath(catalogName)
+	outputPath, err := wsSet.Root().CatalogPath(cfg.catalogName)
 	if err != nil {
-		return err
+		return cataloghtml.SiteConfig{}, err
 	}
 	outputPath = filepath.Join("/", outputPath, "_html")
-	if c.String("output") != "" {
-		outputPath = c.String("output")
+	if cfg.outputPathOverride != "" {
+		outputPath = cfg.outputPathOverride
 	}
 
 	// by default, the URL prefix is the same as the output path,
@@ -818,30 +854,73 @@ func cmdGenerateHtml(c *cli.Context) error {
 	// however, to allow for generating a hosted site, this can be
 	// overridden by the CLI
 	urlPrefix := outputPath
-	if c.String("url-prefix") != "" {
-		urlPrefix = c.String("url-prefix")
+	if cfg.urlPrefix != "" {
+		urlPrefix = cfg.urlPrefix
 	}
 
 	var warehouseUrl *string = nil
-	if c.String("download-url") != "" {
-		dlUrl := c.String("download-url")
+	if cfg.downloadUrl != "" {
+		dlUrl := cfg.downloadUrl
 		warehouseUrl = &dlUrl
 	}
 
-	cfg := cataloghtml.SiteConfig{
-		Ctx:         context.Background(),
+	return cataloghtml.SiteConfig{
+		Ctx:         ctx,
 		Cat_dab:     cat,
 		OutputPath:  outputPath,
 		URLPrefix:   urlPrefix,
 		DownloadURL: warehouseUrl,
+	}, nil
+}
+
+func cmdGenerateHtml(c *cli.Context) error {
+	pcfg := protoSiteConfig{
+		catalogName:        c.String("name"),
+		outputPathOverride: c.String("output"),
+		urlPrefix:          c.String("url-prefix"),
+		downloadUrl:        c.String("download-url"),
+	}
+	cfg, err := pcfg.SiteConfig(c.Context)
+	if err != nil {
+		return err
+	}
+
+	os.RemoveAll(cfg.OutputPath)
+	if err := cfg.CatalogAndChildrenToHtml(); err != nil {
+		return fmt.Errorf("failed to generate html: %s", err)
+	}
+
+	fmt.Printf("published HTML for catalog %q to %s\n", pcfg.catalogName, cfg.OutputPath)
+
+	return nil
+}
+
+func cmdServe(c *cli.Context) error {
+	pcfg := protoSiteConfig{
+		catalogName:        c.String("name"),
+		outputPathOverride: c.String("output"),
+		urlPrefix:          c.String("url-prefix"),
+		downloadUrl:        c.String("download-url"),
+	}
+	port := c.Uint("port")
+	addr := fmt.Sprintf("%s:%d", "localhost", port)
+
+	cfg, err := pcfg.SiteConfig(c.Context)
+	if err != nil {
+		return err
 	}
 	os.RemoveAll(cfg.OutputPath)
 	if err := cfg.CatalogAndChildrenToHtml(); err != nil {
 		return fmt.Errorf("failed to generate html: %s", err)
 	}
 
-	fmt.Printf("published HTML for catalog %q to %s\n", catalogName, outputPath)
+	fmt.Printf("published HTML for catalog %q to %s\n", pcfg.catalogName, cfg.OutputPath)
 
+	dirHandler := http.Dir(cfg.OutputPath)
+	fmt.Printf("Serving at http://%s\n", addr)
+	if err := http.ListenAndServe(addr, http.FileServer(dirHandler)); err != nil {
+		return err
+	}
 	return nil
 }
 

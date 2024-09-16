@@ -49,6 +49,9 @@ Generates HTML output for the root workspace catalog containing information on m
 ### mirror
 Mirror the contents of a catalog to remote warehouses
 
+### serve
+Generates html and serves
+
 ### help, h
 Shows a list of commands or help for one command
 
